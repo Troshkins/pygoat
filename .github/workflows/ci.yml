@@ -73,9 +73,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Deploy PyGoat (official image)
-        # host networking so the app is reachable at localhost:8000 from the ZAP container
-        run: docker run -d --name pygoat --network host pygoat/pygoat:latest
+      - name: Build PyGoat image from this repository (Task 3 bonus)
+        run: docker build -f Dockerfile -t pygoat-ci:latest .
+
+      - name: Deploy the self-built PyGoat image
+        # Host networking so the app is reachable at localhost:8000 from the ZAP container.
+        # The image bakes in only the code (its CMD just runs gunicorn), so we run DB
+        # migrations before starting gunicorn, otherwise DB-backed pages return 500.
+        run: |
+          docker run -d --name pygoat --network host pygoat-ci:latest \
+            sh -c "python manage.py migrate --noinput && \
+                   exec gunicorn --bind 0.0.0.0:8000 --workers 4 --worker-class gthread --threads 4 --timeout 600 pygoat.wsgi"
 
       - name: Wait for PyGoat to be ready
         run: |
@@ -90,11 +98,27 @@ jobs:
       - name: OWASP ZAP baseline scan
         run: |
           mkdir -p zap-report && chmod 777 zap-report
+          set +e
           docker run --network host -v "${{ github.workspace }}/zap-report:/zap/wrk/:rw" \
             ghcr.io/zaproxy/zaproxy:stable \
             zap-baseline.py -t http://localhost:8000 \
-            -r zap_report.html -J zap_report.json -a \
-            || true   # ZAP exits non-zero when it reports findings; don't fail the job on that
+            -r zap_report.html -J zap_report.json -a
+          rc=$?
+          set -e
+          echo "ZAP exit code: $rc"
+          # ZAP baseline exit codes: 0 = clean, 1 = FAIL-level findings, 2 = WARN-level findings.
+          # All three mean the scan RAN (findings are expected for a vulnerable app).
+          # Anything higher means ZAP itself could not run the scan -> fail the job.
+          if [ "$rc" -gt 2 ]; then
+            echo "::error::ZAP did not complete successfully (exit $rc)"
+            exit 1
+          fi
+          # Safety net: a successful scan must have produced a non-empty report.
+          if [ ! -s zap-report/zap_report.json ]; then
+            echo "::error::ZAP report is missing or empty"
+            exit 1
+          fi
+          echo "ZAP scan completed (exit $rc); findings are recorded in the artifact."
 
       - name: Upload ZAP report
         if: always()
